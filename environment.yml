@@ -1,0 +1,16 @@
+name: rest2
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - openmm>=8.0
+  - openmmforcefields>=0.12
+  - openff-toolkit>=0.14
+  - openff-forcefields
+  - rdkit
+  - parmed
+  - numpy
+  - pip
+  - pip:
+    - openff-interchange
