@@ -223,11 +223,11 @@ def _equil_worker(
         extra_forces=[restraint_em],
     )
     _set_state(sim_em, positions_nm, vel_nm_ps=None, box_nm=box_vectors_nm)
-    sim_em.context.setVelocitiesToTemperature(temperature_K * unit.kelvin)
     sim_em.minimizeEnergy(
         maxIterations=em_max_iter,
         tolerance=10.0 * unit.kilojoule_per_mole / unit.nanometer,
     )
+    sim_em.context.setVelocitiesToTemperature(temperature_K * unit.kelvin)
     pos_em, vel_em, box_em = _get_state(sim_em)
     del sim_em
     print(f"{tag} Phase 0: EM done", flush=True)
@@ -236,7 +236,7 @@ def _equil_worker(
     # Phase 1: NVT at T/2  (gentle heating with restraints)
     # ==================================================================
     print(f"{tag} Phase 1: NVT1 ({T_half:.1f} K) start", flush=True)
-    restraint_nvt1 = _make_restraint_force(topology, ref_pos_nm, restraint_k)
+    restraint_nvt1 = _make_restraint_force(topology, pos_em, 0.5 * restraint_k)
     sim_nvt1 = _build_sim(
         topology, system_xml, T_half, dt,
         platform_name, platform_properties,
@@ -255,7 +255,7 @@ def _equil_worker(
     # Phase 2: NVT at target temperature  (restraints still on)
     # ==================================================================
     print(f"{tag} Phase 2: NVT2 ({temperature_K:.1f} K) start", flush=True)
-    restraint_nvt2 = _make_restraint_force(topology, ref_pos_nm, restraint_k)
+    restraint_nvt2 = _make_restraint_force(topology, pos_nvt1, 0.25 * restraint_k)
     sim_nvt2 = _build_sim(
         topology, system_xml, temperature_K, dt,
         platform_name, platform_properties,
@@ -274,7 +274,7 @@ def _equil_worker(
     # Phase 3: NPT at target temperature + 1 bar  (restraints still on)
     # ==================================================================
     print(f"{tag} Phase 3: NPT ({temperature_K:.1f} K, 1 bar) start", flush=True)
-    restraint_npt = _make_restraint_force(topology, ref_pos_nm, restraint_k)
+    restraint_npt = _make_restraint_force(topology, pos_nvt2, 0.1 * restraint_k)
     barostat = MonteCarloBarostat(1.0 * unit.bar, temperature_K * unit.kelvin)
     sim_npt = _build_sim(
         topology, system_xml, temperature_K, dt,

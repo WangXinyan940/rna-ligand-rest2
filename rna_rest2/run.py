@@ -164,7 +164,7 @@ def parse_args():
     parser.add_argument("--conf_interval", type=int, default=1000,
                         help="Steps between conformation library MC (hottest replica only).")
     # Equilibration
-    parser.add_argument("--em_max_iter", type=int, default=5000)
+    parser.add_argument("--em_max_iter", type=int, default=2000)
     parser.add_argument("--nvt_steps", type=int, default=50_000)
     parser.add_argument("--npt_steps", type=int, default=100_000)
     parser.add_argument("--restraint_k", type=float, default=200.0,
