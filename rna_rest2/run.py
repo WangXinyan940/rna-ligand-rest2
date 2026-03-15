@@ -12,6 +12,14 @@ Simulation design
 * Only the *hottest* replica (index N-1) also performs conformation
   library MC every ``conf_interval`` steps.
 * Shared memory is used for inter-process position/energy transfer.
+
+Note on velocities
+------------------
+equilibrate_all_conformations now returns velocities from the final NPT
+phase, but each replica runs at a temperature different from T_low, so
+ReplicaWorker re-samples velocities from the Maxwell-Boltzmann distribution
+at its own temperature on startup (setVelocitiesToTemperature).  The
+equilibrated velocities are therefore not forwarded to replica subprocesses.
 """
 from __future__ import annotations
 
@@ -195,9 +203,10 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     # ----------------------------------------------------------------
-    # Step 1: Parallel equilibration (EM -> NVT -> NPT)
-    #   - All Context creation happens inside child processes
-    #   - Main process only passes serialized System + numpy arrays
+    # Step 1: Parallel equilibration (EM -> NVT1 -> NVT2 -> NPT)
+    #   All Context creation happens inside child processes.
+    #   Main process only passes serialized System + numpy arrays.
+    #   Returns: (system_xml_clean, pos_nm, vel_nm_ps, box_nm)
     # ----------------------------------------------------------------
     print(f"\n[RUN] Equilibrating {n_conformations} conformations "
           f"with pool size={args.n_replicas}...")
@@ -222,15 +231,16 @@ def main():
         platform_properties={"Precision": "mixed"},
         n_workers=args.n_replicas,
     )
+    # equil_results[i] = (system_xml_clean, pos_nm, vel_nm_ps, box_nm)
 
     # ----------------------------------------------------------------
     # Step 2: Shared memory setup
-    #   - Position SHM: shape (n_replicas, n_atoms * 3), float64
-    #   - Energy SHM:   shape (2 * n_replicas,), float64
-    #                   first half  = energies
-    #                   second half = exchange accept flags
+    #   Position SHM: (n_replicas, n_atoms * 3) float64
+    #   Energy  SHM: (2 * n_replicas,) float64
+    #     first half  = potential energies
+    #     second half = HREX accept/reject flags
     # ----------------------------------------------------------------
-    ref_system_xml, ref_pos_nm, _ = equil_results[0]
+    ref_system_xml, ref_pos_nm, _ref_vel, _ref_box = equil_results[0]
     ref_system = XmlSerializer.deserialize(ref_system_xml)
     n_atoms = ref_system.getNumParticles()
 
@@ -244,9 +254,9 @@ def main():
     print(f"\n[RUN] Position SHM: {pos_shm.name}, shape={pos_shm_shape}")
     print(f"[RUN] Energy  SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
 
-    # Conformation pool: all equilibrated positions
+    # Conformation pool: equilibrated positions for all conformers
     conformation_pool = [
-        equil_results[i][1]
+        equil_results[i][1]   # pos_nm
         for i in range(n_conformations)
     ]
 
@@ -257,6 +267,11 @@ def main():
 
     # ----------------------------------------------------------------
     # Step 4: Launch replica subprocesses
+    #
+    # Each replica starts from the equilibrated positions of one
+    # conformation (round-robin) and re-samples velocities from the
+    # Maxwell-Boltzmann distribution at its own temperature inside
+    # ReplicaWorker.__init__ via setVelocitiesToTemperature.
     # ----------------------------------------------------------------
     print(f"\n[RUN] Launching {args.n_replicas} REST2/HREX replica workers...")
     result_queue = mp.Queue()
@@ -271,7 +286,8 @@ def main():
             platform_props = {"Precision": "mixed"}
 
         init_conf_id = rep_id % n_conformations
-        _, init_pos_nm, init_box_nm = equil_results[init_conf_id]
+        # unpack 4-tuple: system_xml_clean, pos_nm, vel_nm_ps, box_nm
+        _, init_pos_nm, _vel, init_box_nm = equil_results[init_conf_id]
 
         p = mp.Process(
             target=replica_main,
