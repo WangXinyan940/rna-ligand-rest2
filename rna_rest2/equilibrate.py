@@ -150,16 +150,32 @@ def _equil_worker(
     )
     print(f"[conf {conf_id}] EM done", flush=True)
 
-    # --- NVT ---
+    # --- NVT1 ---
     sim.reporters.append(
         StateDataReporter(
-            f"{out_prefix}_nvt.csv", report_interval,
+            f"{out_prefix}_nvt1.csv", report_interval,
             step=True, potentialEnergy=True, temperature=True,
         )
     )
+    sim.reporters.append(DCDReporter(f"{out_prefix}_nvt1.dcd", 1))
+    sim.integrator.setTemperature(150.0 * unit.kelvin)  # start cold to avoid instabilities
+    sim.context.reinitialize(preserveState=True)
     sim.step(nvt_steps)
     sim.reporters.clear()
-    print(f"[conf {conf_id}] NVT done", flush=True)
+    print(f"[conf {conf_id}] NVT1 done", flush=True)
+
+    # --- NVT2 ---
+    sim.reporters.append(
+        StateDataReporter(
+            f"{out_prefix}_nvt2.csv", report_interval,
+            step=True, potentialEnergy=True, temperature=True,
+        )
+    )
+    sim.integrator.setTemperature(300.0 * unit.kelvin)  # start cold to avoid instabilities
+    sim.context.reinitialize(preserveState=True)
+    sim.step(nvt_steps)
+    sim.reporters.clear()
+    print(f"[conf {conf_id}] NVT2 done", flush=True)
 
     # --- NPT ---
     barostat = MonteCarloBarostat(1.0 * unit.bar, temperature)

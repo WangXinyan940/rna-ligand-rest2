@@ -89,32 +89,10 @@ def trim_to_target(
         return topology, positions
 
     # Build new topology and positions without removed residues
-    new_top = app.Topology()
-    new_top.setPeriodicBoxVectors(topology.getPeriodicBoxVectors())
-    new_positions = []
-    atom_map = {}  # old atom index -> new atom index
-
-    for chain in topology.chains():
-        new_chain = new_top.addChain(chain.id)
-        for res in chain.residues():
-            if res.index in remove_indices:
-                continue
-            new_res = new_top.addResidue(res.name, new_chain, res.id)
-            for atom in res.atoms():
-                new_atom = new_top.addAtom(atom.name, atom.element, new_res)
-                atom_map[atom.index] = new_atom.index
-                new_positions.append(pos_nm[atom.index])
-
-    for bond in topology.bonds():
-        a1, a2 = bond
-        if a1.index in atom_map and a2.index in atom_map:
-            atoms = list(new_top.atoms())
-            new_top.addBond(atoms[atom_map[a1.index]], atoms[atom_map[a2.index]])
-
-    new_pos = unit.Quantity(
-        np.array(new_positions, dtype=np.float64), unit.nanometer
-    )
-    return new_top, new_pos
+    print(">>> rebuilding topology to trim excess waters/ions...")
+    mod = Modeller(topology, positions)
+    mod.delete([res for res in topology.residues() if res.index in remove_indices])
+    return mod.topology, mod.positions
 
 
 def equalize_solvation(
@@ -128,9 +106,10 @@ def equalize_solvation(
     min_water = min(c[0] for c in counts)
     min_pos = min(c[1] for c in counts)
     min_neg = min(c[2] for c in counts)
-
+    print(f"  Minimum across conformations: {min_water} waters, {min_pos} pos ions, {min_neg} neg ions")
     result = []
-    for top, pos in solvated_systems:
+    for isyst, (top, pos) in enumerate(solvated_systems):
+        print(f"  Trimming system {isyst} to minimum counts")
         t, p = trim_to_target(top, pos, min_water, min_pos, min_neg)
         result.append((t, p))
     return result

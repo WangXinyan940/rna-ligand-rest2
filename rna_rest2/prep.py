@@ -199,7 +199,8 @@ def main():
         os.makedirs(cdir, exist_ok=True)
 
         pos_nm = s_pos.value_in_unit(unit.nanometer)
-        np.save(os.path.join(cdir, "positions.npy"), pos_nm.astype(np.float64))
+        pos_npy = np.array([(p.x, p.y, p.z) for p in pos_nm])
+        np.save(os.path.join(cdir, "positions.npy"), pos_npy.astype(np.float64))
 
         box = s_top.getPeriodicBoxVectors()
         if box is not None:
@@ -214,11 +215,11 @@ def main():
             "id": i,
             "rna_src": os.path.abspath(args.rna[i]),
             "ligand_src": os.path.abspath(args.ligand[i]),
-            "n_atoms": int(pos_nm.shape[0]),
+            "n_atoms": int(pos_npy.shape[0]),
             "rna_sha256": _file_sha256(args.rna[i]),
             "ligand_sha256": _file_sha256(args.ligand[i]),
         })
-        print(f"  Conformation {i}: {pos_nm.shape[0]} atoms saved")
+        print(f"  Conformation {i}: {pos_npy.shape[0]} atoms saved")
 
     with open(os.path.join(conf_dir, "index.json"), "w") as f:
         json.dump(conformer_index, f, indent=2)
