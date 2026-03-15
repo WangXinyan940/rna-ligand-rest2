@@ -32,7 +32,7 @@ def compute_potential_energy(simulation: Simulation) -> float:
 def attempt_conformation_swap(
     simulation: Simulation,
     topology: app.Topology,
-    conformation_pool: List[np.ndarray],  # list of [n_atoms, 3] arrays in nm
+    conformation_pool: list,  # list of (pos_nm, box_nm) tuples
     temperature: unit.Quantity,
     rng: np.random.Generator,
 ) -> bool:
@@ -40,13 +40,16 @@ def attempt_conformation_swap(
     Attempt a Metropolis MC swap of the current coordinates with a randomly
     chosen conformation from `conformation_pool`.
 
+    Each pool entry is a tuple (positions_nm, box_vectors_nm) so that
+    box vectors are swapped along with positions.
+
     Steps:
     1. Compute E_current
     2. Pick a random conformation j from pool
-    3. Temporarily set positions to conf j
+    3. Temporarily set box vectors and positions to conf j
     4. Compute E_proposed
     5. Accept with Metropolis criterion
-    6. If rejected, restore original positions
+    6. If rejected, restore original state
 
     Returns True if swap was accepted.
     """
@@ -58,11 +61,14 @@ def attempt_conformation_swap(
     )
     e_current = compute_potential_energy(simulation)
 
-    # Pick a random conformation (exclude current if identifiable, just pick randomly)
+    # Pick a random conformation
     j = rng.integers(0, len(conformation_pool))
-    proposed_pos = conformation_pool[j]  # [n_atoms, 3] nm
+    proposed_pos, proposed_box = conformation_pool[j]
 
-    # Set proposed positions, keep box
+    # Set proposed box vectors first, then positions
+    simulation.context.setPeriodicBoxVectors(
+        *[unit.Quantity(v, unit.nanometer) for v in proposed_box]
+    )
     simulation.context.setPositions(
         unit.Quantity(proposed_pos, unit.nanometer)
     )
@@ -75,12 +81,13 @@ def attempt_conformation_swap(
     accepted = metropolis_accept(delta_e, T_K, rng)
 
     if not accepted:
-        # Restore previous state
+        # Restore previous state (positions, velocities, box)
         simulation.context.setState(state_current)
     else:
         # Update the pool entry with the previous current conformation
         old_pos = state_current.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        conformation_pool[j] = old_pos
+        old_box = state_current.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
+        conformation_pool[j] = (old_pos, old_box)
 
     return accepted
 

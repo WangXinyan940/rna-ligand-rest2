@@ -11,7 +11,7 @@ Simulation design
   Hamiltonian Replica Exchange (HREX) with alternating odd/even pairing.
 * Only the *hottest* replica (index N-1) also performs conformation
   library MC every ``conf_interval`` steps.
-* Shared memory is used for inter-process position/energy transfer.
+* Shared memory is used for inter-process position/energy/velocity/box transfer.
 
 Note on velocities
 ------------------
@@ -21,6 +21,9 @@ effective temperatures are achieved solely through Hamiltonian scaling.
 ReplicaWorker re-samples velocities from the Maxwell-Boltzmann distribution
 at T_low on startup (setVelocitiesToTemperature).  The equilibrated
 velocities are therefore not forwarded to replica subprocesses.
+
+When HREX exchanges are accepted, positions, velocities, AND periodic box
+vectors are swapped between the two replicas via shared memory.
 """
 from __future__ import annotations
 
@@ -249,15 +252,26 @@ def main():
     pos_shm = shared_memory.SharedMemory(
         create=True, size=int(np.prod(pos_shm_shape)) * 8
     )
+    # Velocity SHM: same layout as positions (n_replicas, n_atoms*3)
+    vel_shm = shared_memory.SharedMemory(
+        create=True, size=int(np.prod(pos_shm_shape)) * 8
+    )
+    # Box vector SHM: (n_replicas, 9) float64 — flattened 3x3 box matrix
+    box_shm_shape = (args.n_replicas, 9)
+    box_shm = shared_memory.SharedMemory(
+        create=True, size=int(np.prod(box_shm_shape)) * 8
+    )
     energy_shm = shared_memory.SharedMemory(
         create=True, size=int(2 * args.n_replicas) * 8
     )
     print(f"\n[RUN] Position SHM: {pos_shm.name}, shape={pos_shm_shape}")
-    print(f"[RUN] Energy  SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
+    print(f"[RUN] Velocity SHM: {vel_shm.name}, shape={pos_shm_shape}")
+    print(f"[RUN] Box      SHM: {box_shm.name}, shape={box_shm_shape}")
+    print(f"[RUN] Energy   SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
 
-    # Conformation pool: equilibrated positions for all conformers
+    # Conformation pool: equilibrated (positions, box_vectors) for all conformers
     conformation_pool = [
-        equil_results[i][1]   # pos_nm
+        (equil_results[i][1], equil_results[i][3])  # (pos_nm, box_nm)
         for i in range(n_conformations)
     ]
 
@@ -299,7 +313,7 @@ def main():
                 args.n_replicas,
                 solv_top,
                 ref_system_xml,
-                [arr.copy() for arr in conformation_pool],
+                [(pos.copy(), bx.copy()) for pos, bx in conformation_pool],
                 init_pos_nm.copy(),
                 init_box_nm,
                 T,
@@ -308,6 +322,9 @@ def main():
                 pos_shm.name,
                 pos_shm_shape,
                 np.float64,
+                vel_shm.name,
+                box_shm.name,
+                box_shm_shape,
                 energy_shm.name,
                 exchange_barrier,
                 args.n_steps,
@@ -333,10 +350,15 @@ def main():
 
     pos_shm.close()
     pos_shm.unlink()
+    vel_shm.close()
+    vel_shm.unlink()
+    box_shm.close()
+    box_shm.unlink()
     energy_shm.close()
     energy_shm.unlink()
 
     print("\n[RUN] REST2/HREX simulation complete.")
+    print("\n  Per-replica swap rates:")
     for r in sorted(results, key=lambda x: x["replica_id"]):
         hottest_tag = " (conf library MC)" if r["replica_id"] == args.n_replicas - 1 else ""
         print(
@@ -344,6 +366,26 @@ def main():
             f"HREX swap rate = {r['hrex_swap_rate']:.3f}"
             f"{hottest_tag}  conf swap rate = {r['conf_swap_rate']:.3f}"
         )
+
+    # Aggregate per-pair acceptance rates from all replicas
+    all_pair_rates: dict = {}
+    for r in results:
+        for pair_str, rate in r.get("pair_rates", {}).items():
+            if pair_str not in all_pair_rates:
+                all_pair_rates[pair_str] = rate
+    if all_pair_rates:
+        print("\n  Per-pair HREX acceptance rates:")
+        for pair_str in sorted(all_pair_rates):
+            i_str, j_str = pair_str.split("-")
+            i, j = int(i_str), int(j_str)
+            print(
+                f"    Pair ({i},{j})  "
+                f"({temperatures[i]:.1f} K <-> {temperatures[j]:.1f} K): "
+                f"{all_pair_rates[pair_str]:.3f}"
+            )
+
+    log_path = os.path.join(args.outdir, "exchange_stats.log")
+    print(f"\n  Detailed exchange log: {log_path}")
 
 
 if __name__ == "__main__":

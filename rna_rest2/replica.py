@@ -39,6 +39,7 @@ through HREX.
 """
 from __future__ import annotations
 
+import logging
 import os
 from multiprocessing import shared_memory
 from multiprocessing import Barrier, Queue
@@ -91,6 +92,34 @@ def _read_from_shm(
 
 
 # ---------------------------------------------------------------------------
+# Shared-memory helpers for box vectors
+# ---------------------------------------------------------------------------
+
+def _write_box_to_shm(
+    shm_name: str,
+    shm_shape: Tuple[int, int],  # (n_replicas, 9)
+    replica_id: int,
+    box_nm: np.ndarray,  # [3, 3] nm
+) -> None:
+    shm = shared_memory.SharedMemory(name=shm_name)
+    arr = np.ndarray(shm_shape, dtype=np.float64, buffer=shm.buf)
+    arr[replica_id, :] = box_nm.flatten()
+    shm.close()
+
+
+def _read_box_from_shm(
+    shm_name: str,
+    shm_shape: Tuple[int, int],  # (n_replicas, 9)
+    replica_j: int,
+) -> np.ndarray:
+    shm = shared_memory.SharedMemory(name=shm_name)
+    arr = np.ndarray(shm_shape, dtype=np.float64, buffer=shm.buf)
+    flat = arr[replica_j, :].copy()
+    shm.close()
+    return flat.reshape(3, 3)
+
+
+# ---------------------------------------------------------------------------
 # Shared-memory for energy exchange
 # ---------------------------------------------------------------------------
 
@@ -133,7 +162,7 @@ class ReplicaWorker:
         n_replicas: int,
         topology: app.Topology,
         system_xml: str,
-        conformation_positions: List[np.ndarray],  # [n_conf, n_atoms, 3] in nm
+        conformation_positions: list,               # [(pos_nm, box_nm), ...] tuples
         initial_positions: np.ndarray,             # [n_atoms, 3] nm
         box_vectors: np.ndarray,                   # [3, 3] nm
         temperature: float,                        # Kelvin
@@ -142,6 +171,9 @@ class ReplicaWorker:
         shm_name: str,                             # position shared memory block name
         shm_shape: Tuple[int, int],                # (n_replicas, n_atoms*3)
         shm_dtype: np.dtype,
+        vel_shm_name: str,                         # velocity shared memory block name
+        box_shm_name: str,                         # box vector shared memory block name
+        box_shm_shape: Tuple[int, int],            # (n_replicas, 9)
         energy_shm_name: str,                      # energy shared memory block name
         exchange_barrier: Barrier,
         dt: float = 0.002,                         # ps
@@ -167,6 +199,9 @@ class ReplicaWorker:
         self.shm_name = shm_name
         self.shm_shape = shm_shape
         self.shm_dtype = shm_dtype
+        self.vel_shm_name = vel_shm_name
+        self.box_shm_name = box_shm_name
+        self.box_shm_shape = box_shm_shape
         self.energy_shm_name = energy_shm_name
         self.exchange_barrier = exchange_barrier
         self.is_hottest = (replica_id == n_replicas - 1)
@@ -229,12 +264,40 @@ class ReplicaWorker:
         )
 
     # ------------------------------------------------------------------
-    # Position helpers
+    # State helpers (positions, velocities, box vectors)
     # ------------------------------------------------------------------
 
     def _get_positions_nm(self) -> np.ndarray:
         state = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
         return state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+
+    def _get_velocities_nm_ps(self) -> np.ndarray:
+        state = self.simulation.context.getState(getVelocities=True)
+        return state.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        )
+
+    def _get_box_vectors_nm(self) -> np.ndarray:
+        state = self.simulation.context.getState(enforcePeriodicBox=True)
+        box = state.getPeriodicBoxVectors(asNumpy=True)
+        return box.value_in_unit(unit.nanometer)  # [3, 3]
+
+    def _set_state_nm(
+        self,
+        pos_nm: np.ndarray,
+        vel_nm_ps: np.ndarray,
+        box_nm: np.ndarray,
+    ) -> None:
+        """Set positions, velocities, and periodic box vectors."""
+        self.simulation.context.setPeriodicBoxVectors(
+            *[unit.Quantity(v, unit.nanometer) for v in box_nm]
+        )
+        self.simulation.context.setPositions(
+            unit.Quantity(pos_nm, unit.nanometer)
+        )
+        self.simulation.context.setVelocities(
+            unit.Quantity(vel_nm_ps, unit.nanometer / unit.picosecond)
+        )
 
     def _set_positions_nm(self, pos_nm: np.ndarray) -> None:
         self.simulation.context.setPositions(
@@ -264,26 +327,37 @@ class ReplicaWorker:
     # HREX: one exchange round
     # ------------------------------------------------------------------
 
-    def do_hrex_round(self, exchange_round: int, rng: np.random.Generator) -> bool:
+    def do_hrex_round(
+        self, exchange_round: int, rng: np.random.Generator
+    ) -> Tuple[bool, int]:
         """
         Perform one REST2 HREX round using odd/even neighbor pairing.
 
         REST2 exchange criterion requires cross-energies: each replica
         evaluates its partner's coordinates under its own scaled Hamiltonian.
 
+        When an exchange is accepted, positions, velocities, AND periodic
+        box vectors are swapped between the two replicas.
+
         exchange_round: monotonically increasing counter used to alternate
                         odd and even pairings.
 
-        Returns True if this replica swapped positions with its neighbor.
+        Returns (swapped, partner) where partner is -1 if this replica
+        had no partner this round.
         """
         i = self.replica_id
         n = self.n_replicas
         T_ref = self.reference_temperature.value_in_unit(unit.kelvin)
 
-        # ----- Phase 1: write positions and self-energy to shared memory -----
+        # ----- Phase 1: write positions, velocities, box, and self-energy -----
         pos = self._get_positions_nm()
+        vel = self._get_velocities_nm_ps()
+        box = self._get_box_vectors_nm()
         e_self = self.get_potential_energy()
+
         _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, i, pos)
+        _write_to_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, i, vel)
+        _write_box_to_shm(self.box_shm_name, self.box_shm_shape, i, box)
         _write_energy_to_shm(self.energy_shm_name, n, i, e_self)
 
         # All replicas must finish writing before anyone reads
@@ -342,34 +416,38 @@ class ReplicaWorker:
             accept = attempt_replica_exchange(
                 e_ii, e_jj, e_ij, e_ji, T_ref, rng
             )
-            print(f"Replica {i}-{j} exchange (dE={e_ij+e_ji-e_ii-e_jj:.2f} kJ/mol): {'ACCEPT' if accept else 'REJECT'}")
             if accept:
-                # rewrite positions in shared memory
-                pos_i = _read_from_shm(
-                    self.shm_name, self.shm_shape, self.shm_dtype, i
-                )
-                pos_j = _read_from_shm(
-                    self.shm_name, self.shm_shape, self.shm_dtype, j
-                )
-                _write_to_shm(
-                    self.shm_name, self.shm_shape, self.shm_dtype, i, pos_j
-                )
-                _write_to_shm(
-                    self.shm_name, self.shm_shape, self.shm_dtype, j, pos_i
-                )
+                swapped = True
+                # Swap positions in shared memory
+                pos_i = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, i)
+                pos_j = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, j)
+                _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, i, pos_j)
+                _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, j, pos_i)
 
-        # All proposers must finish before acceptors read the flag
+                # Swap velocities in shared memory
+                vel_i = _read_from_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, i)
+                vel_j = _read_from_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, j)
+                _write_to_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, i, vel_j)
+                _write_to_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, j, vel_i)
+
+                # Swap box vectors in shared memory
+                box_i = _read_box_from_shm(self.box_shm_name, self.box_shm_shape, i)
+                box_j = _read_box_from_shm(self.box_shm_name, self.box_shm_shape, j)
+                _write_box_to_shm(self.box_shm_name, self.box_shm_shape, i, box_j)
+                _write_box_to_shm(self.box_shm_name, self.box_shm_shape, j, box_i)
+
+        # All proposers must finish before acceptors read
         self.exchange_barrier.wait()
 
-        # Load new positions
-        new_pos = _read_from_shm(
-            self.shm_name, self.shm_shape, self.shm_dtype, i
-        )
-        self._set_positions_nm(new_pos)
+        # Load new positions, velocities, and box vectors from SHM
+        new_pos = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, i)
+        new_vel = _read_from_shm(self.vel_shm_name, self.shm_shape, self.shm_dtype, i)
+        new_box = _read_box_from_shm(self.box_shm_name, self.box_shm_shape, i)
+        self._set_state_nm(new_pos, new_vel, new_box)
 
         # Final barrier: all replicas have applied swaps
         self.exchange_barrier.wait()
-        return swapped
+        return swapped, partner
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +459,7 @@ def replica_main(
     n_replicas: int,
     topology,
     system_xml: str,
-    conformation_positions: List[np.ndarray],
+    conformation_positions: list,             # [(pos_nm, box_nm), ...]
     initial_positions: np.ndarray,
     box_vectors: np.ndarray,
     temperature: float,
@@ -390,6 +468,9 @@ def replica_main(
     shm_name: str,
     shm_shape: tuple,
     shm_dtype,
+    vel_shm_name: str,
+    box_shm_name: str,
+    box_shm_shape: tuple,
     energy_shm_name: str,
     exchange_barrier: Barrier,
     n_total_steps: int,
@@ -422,6 +503,9 @@ def replica_main(
         shm_name=shm_name,
         shm_shape=shm_shape,
         shm_dtype=shm_dtype,
+        vel_shm_name=vel_shm_name,
+        box_shm_name=box_shm_name,
+        box_shm_shape=box_shm_shape,
         energy_shm_name=energy_shm_name,
         exchange_barrier=exchange_barrier,
         dt=0.002,
@@ -433,12 +517,28 @@ def replica_main(
         platform_properties=platform_properties,
     )
 
+    # --- Setup per-replica exchange logger ---
+    xlog = logging.getLogger(f"exchange.replica_{replica_id}")
+    xlog.setLevel(logging.INFO)
+    xlog.propagate = False
+    log_path = os.path.join(out_dir, "exchange_stats.log")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    xlog.addHandler(fh)
+
     steps_done = 0
     exchange_round = 0
     conf_swap_accepted = 0
     conf_swap_attempted = 0
     hrex_accepted = 0
     hrex_attempted = 0
+    # Per-pair tracking: key = (min(i, partner), max(i, partner))
+    pair_attempted: dict = {}
+    pair_accepted: dict = {}
+
+    log_every = 10  # log acceptance rates every N exchange rounds
 
     while steps_done < n_total_steps:
         # --- Run a block of MD ---
@@ -448,10 +548,33 @@ def replica_main(
 
         # --- HREX neighbor exchange (all replicas participate) ---
         if steps_done % hrex_interval == 0:
-            swapped = worker.do_hrex_round(exchange_round, rng)
+            swapped, partner = worker.do_hrex_round(exchange_round, rng)
             hrex_attempted += 1
             if swapped:
                 hrex_accepted += 1
+
+            # Track per-pair stats (only for replicas that had a partner)
+            if partner >= 0:
+                pair_key = (min(replica_id, partner), max(replica_id, partner))
+                pair_attempted[pair_key] = pair_attempted.get(pair_key, 0) + 1
+                if swapped:
+                    pair_accepted[pair_key] = pair_accepted.get(pair_key, 0) + 1
+
+                xlog.info(
+                    "HREX  round=%d  pair=(%d,%d)  %s  running_rate=%.3f",
+                    exchange_round, pair_key[0], pair_key[1],
+                    "ACCEPT" if swapped else "REJECT",
+                    pair_accepted.get(pair_key, 0) / pair_attempted[pair_key],
+                )
+
+            # Periodic summary every log_every rounds
+            if exchange_round > 0 and exchange_round % log_every == 0:
+                xlog.info(
+                    "HREX  replica=%d  round=%d  overall_rate=%.3f",
+                    replica_id, exchange_round,
+                    hrex_accepted / max(1, hrex_attempted),
+                )
+
             exchange_round += 1
 
         # --- Conformation library MC (hottest replica only) ---
@@ -464,12 +587,42 @@ def replica_main(
                 worker.reference_temperature,
                 rng,
             )
-            print(f"Replica {replica_id}: Conformation swap {'accepted' if accepted else 'rejected'}")
             if accepted:
                 conf_swap_accepted += 1
+
+            xlog.info(
+                "CONF  replica=%d  step=%d  %s  running_rate=%.3f",
+                replica_id, steps_done,
+                "ACCEPT" if accepted else "REJECT",
+                conf_swap_accepted / max(1, conf_swap_attempted),
+            )
+
+    # --- Final summary ---
+    xlog.info(
+        "FINAL  replica=%d  hrex_rate=%.3f (%d/%d)  conf_rate=%.3f (%d/%d)",
+        replica_id,
+        hrex_accepted / max(1, hrex_attempted), hrex_accepted, hrex_attempted,
+        conf_swap_accepted / max(1, conf_swap_attempted), conf_swap_accepted, conf_swap_attempted,
+    )
+    for pair_key in sorted(pair_attempted):
+        acc = pair_accepted.get(pair_key, 0)
+        att = pair_attempted[pair_key]
+        xlog.info(
+            "FINAL  pair=(%d,%d)  rate=%.3f (%d/%d)",
+            pair_key[0], pair_key[1], acc / max(1, att), acc, att,
+        )
+
+    # Flush and close handler
+    fh.flush()
+    fh.close()
+    xlog.removeHandler(fh)
 
     result_queue.put({
         "replica_id": replica_id,
         "hrex_swap_rate": hrex_accepted / max(1, hrex_attempted),
         "conf_swap_rate": conf_swap_accepted / max(1, conf_swap_attempted),
+        "pair_rates": {
+            f"{k[0]}-{k[1]}": pair_accepted.get(k, 0) / max(1, v)
+            for k, v in pair_attempted.items()
+        },
     })
