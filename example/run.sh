@@ -1,0 +1,2 @@
+rna-rest2-prep --rna rec.frag.pdb rec.frag.pdb --ligand c1-H.sdf c2-H.sdf c3-H.sdf --padding 1.0 --overwrite
+rna-rest2-run --prep_dir prep_out --n_replicas 8 --n_steps 100000 --hrex_interval 5000 --conf_interval 5000

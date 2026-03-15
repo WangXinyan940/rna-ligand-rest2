@@ -154,7 +154,7 @@ def parse_args():
     # Temperature
     parser.add_argument("--T_low", type=float, default=300.0,
                         help="Lowest replica temperature (K).")
-    parser.add_argument("--T_high", type=float, default=600.0,
+    parser.add_argument("--T_high", type=float, default=450.0,
                         help="Highest replica temperature (K).")
     parser.add_argument("--n_replicas", type=int, default=4,
                         help="Number of REST2 replicas.")
