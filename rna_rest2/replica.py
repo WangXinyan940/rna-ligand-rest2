@@ -309,15 +309,19 @@ class ReplicaWorker:
         state = self.simulation.context.getState(getEnergy=True)
         return state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
 
-    def compute_energy_for_positions(self, pos_nm: np.ndarray) -> float:
+    def compute_energy_for_positions(self, pos_nm: np.ndarray, box_nm: np.ndarray) -> float:
         """Compute potential energy for foreign coordinates under this replica's
         scaled Hamiltonian, then restore own coordinates."""
         own_state = self.simulation.context.getState(getPositions=True)
         self.simulation.context.setPositions(
             unit.Quantity(pos_nm, unit.nanometer)
         )
+        self.simulation.context.setPeriodicBoxVectors(
+            *[unit.Quantity(v, unit.nanometer) for v in box_nm]
+        )
         energy = self.get_potential_energy()
         self.simulation.context.setPositions(own_state.getPositions())
+        self.simulation.context.setPeriodicBoxVectors(*own_state.getPeriodicBoxVectors())
         return energy
 
     def run_steps(self, n_steps: int) -> None:
@@ -387,7 +391,10 @@ class ReplicaWorker:
             pos_partner = _read_from_shm(
                 self.shm_name, self.shm_shape, self.shm_dtype, partner
             )
-            e_cross = self.compute_energy_for_positions(pos_partner)
+            box_partner = _read_box_from_shm(
+                self.box_shm_name, self.box_shm_shape, partner
+            )
+            e_cross = self.compute_energy_for_positions(pos_partner, box_partner)
         else:
             e_cross = 0.0
 
@@ -416,6 +423,7 @@ class ReplicaWorker:
             accept = attempt_replica_exchange(
                 e_ii, e_jj, e_ij, e_ji, T_ref, rng
             )
+            print(f">>> dE({i}-{j}) = {e_ij + e_ji - e_ii - e_jj:.2f} kJ/mol, accept={accept}")
             if accept:
                 swapped = True
                 # Swap positions in shared memory
