@@ -48,12 +48,11 @@ import numpy as np
 from openmm import (
     LangevinMiddleIntegrator,
     Platform,
-    Simulation,
     XmlSerializer,
     app,
     unit,
 )
-from openmm.app import DCDReporter, StateDataReporter
+from openmm.app import DCDReporter, StateDataReporter, Simulation
 
 from .rest2 import apply_rest2_scaling, store_original_parameters
 from .exchange import attempt_conformation_swap, attempt_replica_exchange

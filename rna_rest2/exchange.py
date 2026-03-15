@@ -5,7 +5,8 @@ import math
 from typing import List
 
 import numpy as np
-from openmm import unit, Simulation, app
+from openmm import unit, app
+from openmm.app import Simulation
 
 KB = 8.314462618e-3  # kJ/mol/K
 

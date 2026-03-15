@@ -7,3 +7,4 @@
 pixi.lock
 
 *.egg-info
+*.pyc

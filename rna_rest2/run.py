@@ -58,7 +58,8 @@ def geometric_temperature_ladder(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="REST2/HREX MD simulation for multi-conformation RNA-ligand complexes."
+        description="REST2/HREX MD simulation for multi-conformation RNA-ligand complexes.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--rna", nargs="+", required=True,
@@ -88,7 +89,7 @@ def parse_args():
     parser.add_argument("--em_max_iter", type=int, default=5000)
     parser.add_argument("--nvt_steps", type=int, default=50_000)
     parser.add_argument("--npt_steps", type=int, default=100_000)
-    parser.add_argument("--restraint_k", type=float, default=1000.0,
+    parser.add_argument("--restraint_k", type=float, default=200.0,
                         help="Restraint force constant kJ/mol/nm^2.")
     parser.add_argument("--report_interval", type=int, default=5000)
     # Solvation
