@@ -81,3 +81,39 @@ def build_complex_system(
 
     ff = build_forcefield(lig_mol, ff_xmls)
     return modeller.topology, modeller.positions, ff
+
+
+def build_rna_system(
+    rna_pdb: str,
+    ff_xmls: list[str] | None = None,
+) -> Tuple[app.Topology, unit.Quantity, ForceField]:
+    """
+    Load a pure-RNA structure and build an amber14 ForceField (no ligand).
+
+    This is suitable for REST2/HREX simulations of RNA alone, without any
+    small-molecule ligand.  OpenFF / SMIRNOFFTemplateGenerator is **not**
+    required for this pathway.
+
+    Parameters
+    ----------
+    rna_pdb : str
+        Path to the RNA PDB file.
+    ff_xmls : list[str] | None
+        OpenMM force-field XML files to load.  Defaults to
+        ``["amber14-all.xml", "amber14/tip3pfb.xml"]``.
+
+    Returns
+    -------
+    topology : app.Topology
+        RNA topology (unsolvated).
+    positions : unit.Quantity
+        RNA atom positions.
+    ff : ForceField
+        Force field object ready for createSystem().
+    """
+    if ff_xmls is None:
+        ff_xmls = ["amber14-all.xml", "amber14/tip3pfb.xml"]
+
+    rna_top, rna_pos = load_rna_pdb(rna_pdb)
+    ff = ForceField(*ff_xmls)
+    return rna_top, rna_pos, ff
