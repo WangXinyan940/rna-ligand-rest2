@@ -1,68 +1,94 @@
-# RNA-Ligand REST2 MD Simulation
+# rna-ligand-rest2
 
-OpenMM-based REST2 (Replica Exchange with Solute Tempering 2) molecular dynamics simulation for RNA-small molecule complexes with multiple conformations.
+REST2/HREX molecular dynamics for multi-conformation RNA–ligand complexes
+using OpenMM and OpenFF.
 
-## Features
+## Two-stage workflow
 
-- **Multi-conformation support**: Takes multiple RNA-ligand conformations (RNA as PDB, ligand as SDF). Atom order is consistent across conformations.
-- **Force fields**: OpenMM built-in ForceField for RNA (amber14); OpenFF Sage for small molecules via `openff-toolkit`.
-- **Solvation**: OpenMM Modeller adds water/ions; all replicas are trimmed to the same number of waters and ions.
-- **Equilibration**: EM → NVT → NPT with heavy-atom positional restraints for each conformation.
-- **REST2**: Scales solute (RNA + ligand) nonbonded parameters (charges × β_eff^0.5, ε × β_eff) via direct modification of `NonbondedForce` and `CustomNonbondedForce` parameters.
-- **Parallel replicas**: Python `multiprocessing` with `shared_memory` for coordinate exchange between replicas.
-- **Conformation swaps**: At fixed intervals, each replica attempts a Metropolis MC swap with one of the stored multi-conformation snapshots.
+The pipeline is split into two independent, decoupled CLI tools:
+
+| Stage | Command | Responsibility |
+|-------|---------|----------------|
+| 1 | `rna-rest2-prep` | Force-field parameterization, solvation, solvent equalization → writes `prep_out/` |
+| 2 | `rna-rest2-run`  | Reads `prep_out/`, runs EM/NVT/NPT equilibration, then REST2/HREX production |
+
+This separation means you can re-run Stage 2 with different temperatures,
+replica counts, or exchange parameters without ever re-doing the expensive
+force-field and solvation work.
 
 ## Installation
 
 ```bash
-conda create -n rest2 python=3.10
+conda env create -f environment.yml
 conda activate rest2
-conda install -c conda-forge openmm openmmforcefields openff-toolkit rdkit parmed
 pip install -e .
 ```
 
-## Quick Start
+## Stage 1 — Preparation
 
 ```bash
-python -m rna_rest2.run \
-  --rna conformations/rna_conf*.pdb \
-  --ligand conformations/lig_conf*.sdf \
+rna-rest2-prep \
+  --rna   rna_conf0.pdb rna_conf1.pdb rna_conf2.pdb \
+  --ligand lig_conf0.sdf lig_conf1.sdf lig_conf2.sdf \
+  --padding 1.2 \
+  --ionic_strength 0.15 \
+  --outdir prep_out
+```
+
+### Output directory layout
+
+```
+prep_out/
+  system.xml                  # serialized OpenMM System
+  reference_topology.pdb      # solvated & trimmed reference topology
+  solvation.json              # water/ion counts, padding, ionic strength
+  manifest.json               # versions, CLI args, completion flag
+  conformers/
+    index.json                # per-conformation metadata + source SHA256
+    conf_000/
+      positions.npy           # float64 [n_atoms, 3] nm
+      box.npy                 # float64 [3, 3] nm
+    conf_001/ ...
+```
+
+## Stage 2 — Simulation
+
+```bash
+rna-rest2-run \
+  --prep_dir prep_out \
   --n_replicas 4 \
-  --temperatures 300 310 330 360 \
+  --T_low 300 --T_high 400 \
   --n_steps 5000000 \
-  --swap_interval 500 \
-  --outdir output/
+  --hrex_interval 500 \
+  --conf_interval 1000 \
+  --device_index 0,1,2,3 \
+  --outdir run_out
 ```
 
-## File Structure
+Stage 2 never reads the original RNA PDB or ligand SDF files — it only
+consumes `prep_out/`. You can run multiple Stage 2 experiments against
+the same `prep_out/`.
 
-```
-rna_rest2/
-  __init__.py
-  forcefield.py      # RNA + OpenFF ligand force field setup
-  solvate.py         # Solvation and ion balancing
-  equilibrate.py     # EM / NVT / NPT equilibration
-  rest2.py           # REST2 parameter scaling
-  replica.py         # Single replica worker (multiprocessing)
-  exchange.py        # Metropolis MC exchange logic
-  run.py             # CLI entry point
-conformations/       # Place your PDB and SDF files here
-output/              # Simulation outputs
-```
+## REST2/HREX algorithm
 
-## REST2 Scaling
+* **N replicas** on a geometric temperature ladder
+  `T_i = T_low × (T_high/T_low)^(i/(N-1))`.
+* **HREX**: every `--hrex_interval` steps all replicas synchronize and
+  attempt neighbor exchanges with alternating odd/even pairing via
+  Metropolis criterion.
+* **Conformation library MC**: only the hottest replica (highest temperature)
+  attempts a swap with the conformation pool every `--conf_interval` steps,
+  injecting structural diversity that propagates down the ladder via HREX.
+* **Multiprocessing**: each replica runs in an isolated child process with
+  its own CUDA context; positions and energies are exchanged via shared memory.
 
-For replica at temperature `T` with reference temperature `T0`:
+## Key implementation notes
 
-- Scale factor: `λ = T0 / T` (0 < λ ≤ 1 for hotter replicas)
-- Solute charges: multiplied by `sqrt(λ)`
-- Solute LJ epsilon: multiplied by `λ`
-- Solute-solvent interactions: multiplied by `sqrt(λ)` for charges, `sqrt(λ)` for LJ epsilon
-
-This follows the Wang et al. 2011 REST2 formulation.
-
-## References
-
-- Wang, L. et al. *J. Phys. Chem. B* **115**, 9431 (2011). REST2.
-- Eastman, P. et al. *PLOS Comput. Biol.* OpenMM 7.
-- Boothroyd, S. et al. OpenFF Sage force field.
+- OpenMM Context isolation: the main process never creates a Context.
+  All EM/NVT/NPT equilibration and production simulations run inside
+  child processes, avoiding the CUDA context inheritance bug.
+- Equilibration uses a `ProcessPoolExecutor` of size `--n_replicas` to
+  parallelize across all conformations.
+- System serialization (`system.xml`) is written once in Stage 1 and
+  reused identically in Stage 2, ensuring the production run uses exactly
+  the same force-field parameters that were equilibrated.

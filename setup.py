@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="rna-ligand-rest2",
-    version="0.1.0",
+    version="0.2.0",
     description="REST2 MD simulation for RNA-ligand complexes with OpenMM and OpenFF",
     author="WangXinyan940",
     packages=find_packages(),
@@ -16,7 +16,10 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "rna-rest2=rna_rest2.run:main",
+            # Stage 1: parameterization + solvation + solvent equalization
+            "rna-rest2-prep=rna_rest2.prep:main",
+            # Stage 2: equilibration + REST2/HREX production
+            "rna-rest2-run=rna_rest2.run:main",
         ]
     },
 )

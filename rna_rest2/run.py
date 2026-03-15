@@ -1,30 +1,32 @@
-"""CLI entry point: orchestrates multi-conformation REST2/HREX simulation.
+"""Stage 2: equilibration + REST2/HREX production simulation.
+
+Reads the prep directory written by ``rna-rest2-prep`` (Stage 1) and
+never re-invokes ForceField, Modeller, or solvation logic.
 
 Simulation design
 -----------------
-* N replicas are created on a geometric temperature ladder [T_low, T_high].
+* N replicas on a geometric temperature ladder [T_low, T_high].
 * Each replica runs in its own subprocess with its own OpenMM Context.
 * Every ``hrex_interval`` MD steps all replicas synchronize and attempt
-  Hamiltonian Replica Exchange (HREX) between adjacent (neighbor) replicas
-  using an alternating odd/even pairing scheme.
-* Only the *hottest* replica (index N-1, highest temperature) also performs
-  conformation library MC every ``conf_interval`` steps to inject structural
-  diversity.
-* Shared memory is used for efficient inter-process position/energy transfer.
+  Hamiltonian Replica Exchange (HREX) with alternating odd/even pairing.
+* Only the *hottest* replica (index N-1) also performs conformation
+  library MC every ``conf_interval`` steps.
+* Shared memory is used for inter-process position/energy transfer.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
+import sys
 from multiprocessing import shared_memory
 from typing import List
 
 import numpy as np
 from openmm import XmlSerializer, app, unit
+from openmm.app import PDBFile
 
-from .forcefield import build_complex_system
-from .solvate import solvate_system, equalize_solvation
 from .equilibrate import equilibrate_all_conformations
 from .replica import replica_main
 
@@ -39,9 +41,9 @@ def geometric_temperature_ladder(
     T_high: float,
 ) -> List[float]:
     """
-    Geometric spacing: T_i = T_low * (T_high / T_low)^(i / (n-1))
-    Gives equal acceptance probability across adjacent replicas under
-    the assumption that heat capacity is roughly constant.
+    T_i = T_low * (T_high / T_low)^(i / (n-1))
+    Geometric spacing gives equal acceptance probability under constant
+    heat-capacity assumption.
     """
     if n_replicas == 1:
         return [T_low]
@@ -53,21 +55,89 @@ def geometric_temperature_ladder(
 
 
 # ---------------------------------------------------------------------------
+# Prep directory loader & validator
+# ---------------------------------------------------------------------------
+
+def load_prep_dir(prep_dir: str):
+    """
+    Load and validate the prep directory produced by Stage 1.
+
+    Returns
+    -------
+    system_xml : str
+    topology   : app.Topology
+    conformers : list of {"positions_nm": np.ndarray, "box_nm": np.ndarray}
+    manifest   : dict
+    """
+    def _require(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Required prep artifact not found: {path}\n"
+                "Run rna-rest2-prep first."
+            )
+        return path
+
+    manifest_path = _require(os.path.join(prep_dir, "manifest.json"))
+    manifest = json.loads(open(manifest_path).read())
+    if not manifest.get("completed"):
+        raise RuntimeError(
+            f"{prep_dir}/manifest.json exists but 'completed' is False. "
+            "Stage 1 may have been interrupted; re-run rna-rest2-prep."
+        )
+
+    system_xml_path = _require(os.path.join(prep_dir, "system.xml"))
+    system_xml = open(system_xml_path).read()
+
+    ref_pdb_path = _require(os.path.join(prep_dir, "reference_topology.pdb"))
+    with open(ref_pdb_path) as f:
+        pdb = PDBFile(f)
+    topology = pdb.topology
+
+    conf_index_path = _require(os.path.join(prep_dir, "conformers", "index.json"))
+    conf_index = json.loads(open(conf_index_path).read())
+
+    conformers = []
+    for entry in conf_index:
+        i = entry["id"]
+        cdir = os.path.join(prep_dir, "conformers", f"conf_{i:03d}")
+        pos_nm = np.load(_require(os.path.join(cdir, "positions.npy")))
+        box_nm = np.load(_require(os.path.join(cdir, "box.npy")))
+        conformers.append({"positions_nm": pos_nm, "box_nm": box_nm})
+
+    # Validate atom count consistency
+    system = XmlSerializer.deserialize(system_xml)
+    n_atoms_sys = system.getNumParticles()
+    for i, c in enumerate(conformers):
+        if c["positions_nm"].shape[0] != n_atoms_sys:
+            raise ValueError(
+                f"Conformer {i} has {c['positions_nm'].shape[0]} atoms but "
+                f"system.xml has {n_atoms_sys}. Prep directory may be corrupt."
+            )
+
+    print(f"[RUN] Loaded prep directory: {os.path.abspath(prep_dir)}")
+    print(f"  Completed at  : {manifest.get('completed_at', 'unknown')}")
+    print(f"  Conformations : {len(conformers)}")
+    print(f"  Atoms/system  : {n_atoms_sys}")
+    print(f"  OpenMM ver    : {manifest.get('openmm_version', 'unknown')}")
+
+    return system_xml, topology, conformers, manifest
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="REST2/HREX MD simulation for multi-conformation RNA-ligand complexes.",
+        description=(
+            "Stage 2: equilibrate and run REST2/HREX simulation. "
+            "Reads the prep directory written by rna-rest2-prep."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--rna", nargs="+", required=True,
-        help="RNA PDB files, one per conformation (consistent atom order).",
-    )
-    parser.add_argument(
-        "--ligand", nargs="+", required=True,
-        help="Ligand SDF files, one per conformation (consistent atom order).",
+        "--prep_dir", type=str, required=True,
+        help="Path to the prep directory produced by rna-rest2-prep (Stage 1).",
     )
     # Temperature
     parser.add_argument("--T_low", type=float, default=300.0,
@@ -84,7 +154,7 @@ def parse_args():
     parser.add_argument("--hrex_interval", type=int, default=500,
                         help="Steps between HREX neighbor exchange rounds.")
     parser.add_argument("--conf_interval", type=int, default=1000,
-                        help="Steps between conformation library MC attempts (hottest replica only).")
+                        help="Steps between conformation library MC (hottest replica only).")
     # Equilibration
     parser.add_argument("--em_max_iter", type=int, default=5000)
     parser.add_argument("--nvt_steps", type=int, default=50_000)
@@ -92,13 +162,9 @@ def parse_args():
     parser.add_argument("--restraint_k", type=float, default=200.0,
                         help="Restraint force constant kJ/mol/nm^2.")
     parser.add_argument("--report_interval", type=int, default=5000)
-    # Solvation
-    parser.add_argument("--padding", type=float, default=1.2,
-                        help="Solvation box padding (nm).")
-    parser.add_argument("--ionic_strength", type=float, default=0.15,
-                        help="Ionic strength (mol/L).")
     # Infrastructure
-    parser.add_argument("--outdir", type=str, default="output")
+    parser.add_argument("--outdir", type=str, default="run_out",
+                        help="Output directory for trajectories and run logs.")
     parser.add_argument("--platform", type=str, default="CUDA")
     parser.add_argument(
         "--device_index", type=str, default=None,
@@ -113,76 +179,35 @@ def parse_args():
 
 def main():
     args = parse_args()
-    assert len(args.rna) == len(args.ligand), (
-        "Number of RNA PDB and ligand SDF files must match."
-    )
-    n_conformations = len(args.rna)
+
+    # --- Load prep artifacts ---
+    system_xml, solv_top, conformers, manifest = load_prep_dir(args.prep_dir)
+    n_conformations = len(conformers)
 
     # --- Geometric temperature ladder ---
     temperatures = geometric_temperature_ladder(args.n_replicas, args.T_low, args.T_high)
-    print("[INFO] Replica temperatures (K):")
+    print("\n[RUN] Replica temperatures (K):")
     for i, T in enumerate(temperatures):
         lam = args.T_low / T
-        tag = " <-- hottest (conformation library MC enabled)" if i == args.n_replicas - 1 else ""
+        tag = " <-- hottest" if i == args.n_replicas - 1 else ""
         print(f"  replica {i:2d}: {T:7.2f} K  lambda={lam:.4f}{tag}")
 
     os.makedirs(args.outdir, exist_ok=True)
 
     # ----------------------------------------------------------------
-    # Step 1: Build complex topology + force field
+    # Step 1: Parallel equilibration (EM -> NVT -> NPT)
+    #   - All Context creation happens inside child processes
+    #   - Main process only passes serialized System + numpy arrays
     # ----------------------------------------------------------------
-    print("\n[INFO] Building complex systems...")
-    topologies, positions_list, ffs = [], [], []
-    for i, (rna_pdb, lig_sdf) in enumerate(zip(args.rna, args.ligand)):
-        print(f"  Conformation {i}: {rna_pdb} + {lig_sdf}")
-        top, pos, ff = build_complex_system(rna_pdb, lig_sdf)
-        topologies.append(top)
-        positions_list.append(pos)
-        ffs.append(ff)
-
-    # ----------------------------------------------------------------
-    # Step 2: Solvate
-    # ----------------------------------------------------------------
-    print("\n[INFO] Solvating conformations...")
-    solvated = []
-    for i, (top, pos, ff) in enumerate(zip(topologies, positions_list, ffs)):
-        print(f"  Solvating conformation {i}...")
-        s_top, s_pos = solvate_system(
-            top, pos, ff,
-            padding=args.padding * unit.nanometer,
-            ionic_strength=args.ionic_strength * unit.molar,
-        )
-        solvated.append((s_top, s_pos))
-
-    print("[INFO] Equalizing solvation...")
-    solvated = equalize_solvation(solvated)
-    solv_top = solvated[0][0]
-
-    # ----------------------------------------------------------------
-    # Step 3: Serialize Systems
-    # ----------------------------------------------------------------
-    print("\n[INFO] Creating and serializing OpenMM systems...")
-    ref_ff = ffs[0]
-    system_xmls = []
-    conf_inputs = []
-    for i, (s_top, s_pos) in enumerate(solvated):
-        system = ref_ff.createSystem(
-            s_top,
-            nonbondedMethod=app.PME,
-            nonbondedCutoff=1.0 * unit.nanometer,
-            constraints=app.HBonds,
-            rigidWater=True,
-            removeCMMotion=True,
-        )
-        system_xmls.append(XmlSerializer.serialize(system))
-        pos_nm = s_pos.value_in_unit(unit.nanometer)
-        conf_inputs.append((s_top, pos_nm, None))
-
-    # ----------------------------------------------------------------
-    # Step 4: Parallel equilibration
-    # ----------------------------------------------------------------
-    print(f"\n[INFO] Equilibrating {n_conformations} conformations "
+    print(f"\n[RUN] Equilibrating {n_conformations} conformations "
           f"with pool size={args.n_replicas}...")
+
+    conf_inputs = [
+        (solv_top, c["positions_nm"], c["box_nm"])
+        for c in conformers
+    ]
+    system_xmls = [system_xml] * n_conformations
+
     equil_results = equilibrate_all_conformations(
         conformations=conf_inputs,
         system_xmls=system_xmls,
@@ -199,7 +224,7 @@ def main():
     )
 
     # ----------------------------------------------------------------
-    # Step 5: Shared memory setup
+    # Step 2: Shared memory setup
     #   - Position SHM: shape (n_replicas, n_atoms * 3), float64
     #   - Energy SHM:   shape (2 * n_replicas,), float64
     #                   first half  = energies
@@ -216,8 +241,8 @@ def main():
     energy_shm = shared_memory.SharedMemory(
         create=True, size=int(2 * args.n_replicas) * 8
     )
-    print(f"\n[INFO] Position SHM: {pos_shm.name}, shape={pos_shm_shape}")
-    print(f"[INFO] Energy  SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
+    print(f"\n[RUN] Position SHM: {pos_shm.name}, shape={pos_shm_shape}")
+    print(f"[RUN] Energy  SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
 
     # Conformation pool: all equilibrated positions
     conformation_pool = [
@@ -226,15 +251,14 @@ def main():
     ]
 
     # ----------------------------------------------------------------
-    # Step 6: Synchronization primitive for HREX
+    # Step 3: Synchronization barrier for HREX
     # ----------------------------------------------------------------
-    # 3 barrier waits per HREX round (write, propose, apply)
     exchange_barrier = mp.Barrier(args.n_replicas)
 
     # ----------------------------------------------------------------
-    # Step 7: Launch replica subprocesses
+    # Step 4: Launch replica subprocesses
     # ----------------------------------------------------------------
-    print(f"\n[INFO] Launching {args.n_replicas} REST2/HREX replica workers...")
+    print(f"\n[RUN] Launching {args.n_replicas} REST2/HREX replica workers...")
     result_queue = mp.Queue()
     processes = []
 
@@ -261,7 +285,7 @@ def main():
                 init_box_nm,
                 T,
                 args.T_low,
-                temperatures,                  # full temperature list for HREX criterion
+                temperatures,
                 pos_shm.name,
                 pos_shm_shape,
                 np.float64,
@@ -293,9 +317,9 @@ def main():
     energy_shm.close()
     energy_shm.unlink()
 
-    print("\n[INFO] REST2/HREX simulation complete.")
+    print("\n[RUN] REST2/HREX simulation complete.")
     for r in sorted(results, key=lambda x: x["replica_id"]):
-        hottest_tag = " (conformation library MC)" if r["replica_id"] == args.n_replicas - 1 else ""
+        hottest_tag = " (conf library MC)" if r["replica_id"] == args.n_replicas - 1 else ""
         print(
             f"  Replica {r['replica_id']:2d} ({temperatures[r['replica_id']]:.1f} K): "
             f"HREX swap rate = {r['hrex_swap_rate']:.3f}"
