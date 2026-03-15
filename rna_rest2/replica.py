@@ -175,8 +175,10 @@ class ReplicaWorker:
         self.system = system
         self.original_params = store_original_parameters(system, topology)
 
+        # REST2: all replicas run at T_low in the integrator;
+        # effective temperatures are achieved via Hamiltonian scaling only.
         integrator = LangevinMiddleIntegrator(
-            self.temperature, 1.0 / unit.picosecond, dt * unit.picosecond
+            self.reference_temperature, 1.0 / unit.picosecond, dt * unit.picosecond
         )
 
         props = platform_properties or {}
@@ -193,7 +195,7 @@ class ReplicaWorker:
         self.simulation.context.setPeriodicBoxVectors(
             *[unit.Quantity(v, unit.nanometer) for v in box_vectors]
         )
-        self.simulation.context.setVelocitiesToTemperature(self.temperature)
+        self.simulation.context.setVelocitiesToTemperature(self.reference_temperature)
 
         # Apply REST2 scaling
         apply_rest2_scaling(
@@ -234,11 +236,22 @@ class ReplicaWorker:
         self.simulation.context.setPositions(
             unit.Quantity(pos_nm, unit.nanometer)
         )
-        self.simulation.context.setVelocitiesToTemperature(self.temperature)
+        self.simulation.context.setVelocitiesToTemperature(self.reference_temperature)
 
     def get_potential_energy(self) -> float:
         state = self.simulation.context.getState(getEnergy=True)
         return state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+
+    def compute_energy_for_positions(self, pos_nm: np.ndarray) -> float:
+        """Compute potential energy for foreign coordinates under this replica's
+        scaled Hamiltonian, then restore own coordinates."""
+        own_state = self.simulation.context.getState(getPositions=True)
+        self.simulation.context.setPositions(
+            unit.Quantity(pos_nm, unit.nanometer)
+        )
+        energy = self.get_potential_energy()
+        self.simulation.context.setPositions(own_state.getPositions())
+        return energy
 
     def run_steps(self, n_steps: int) -> None:
         self.simulation.step(n_steps)
@@ -249,7 +262,10 @@ class ReplicaWorker:
 
     def do_hrex_round(self, exchange_round: int, rng: np.random.Generator) -> bool:
         """
-        Perform one HREX round using odd/even neighbor pairing.
+        Perform one REST2 HREX round using odd/even neighbor pairing.
+
+        REST2 exchange criterion requires cross-energies: each replica
+        evaluates its partner's coordinates under its own scaled Hamiltonian.
 
         exchange_round: monotonically increasing counter used to alternate
                         odd and even pairings.
@@ -258,92 +274,141 @@ class ReplicaWorker:
         """
         i = self.replica_id
         n = self.n_replicas
+        T_ref = self.reference_temperature.value_in_unit(unit.kelvin)
 
-        # ----- Phase 1: write positions and energy to shared memory -----
+        # ----- Phase 1: write positions and self-energy to shared memory -----
         pos = self._get_positions_nm()
-        e_i = self.get_potential_energy()
+        e_self = self.get_potential_energy()
         _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, i, pos)
-        _write_energy_to_shm(self.energy_shm_name, n, i, e_i)
+        _write_energy_to_shm(self.energy_shm_name, n, i, e_self)
 
         # All replicas must finish writing before anyone reads
         self.exchange_barrier.wait()
 
-        # ----- Phase 2: determine neighbors and attempt exchange -----
+        # ----- Phase 2: compute cross-energy E_self(X_partner) -----
         # Even rounds: pair (0,1), (2,3), (4,5) ...
         # Odd  rounds: pair (1,2), (3,4), (5,6) ...
         phase = exchange_round % 2
         swapped = False
 
+        # Determine partner for this round
+        partner = -1
         if phase == 0:
-            # even phase: lower replica in pair has even index
+            if i % 2 == 0 and i + 1 < n:
+                partner = i + 1
+            elif i % 2 == 1 and i - 1 >= 0:
+                partner = i - 1
+        else:
+            if i % 2 == 1 and i + 1 < n:
+                partner = i + 1
+            elif i % 2 == 0 and i - 1 >= 0 and i > 0:
+                partner = i - 1
+
+        # Compute cross-energy: E_i(X_partner) under this replica's Hamiltonian
+        if partner >= 0:
+            pos_partner = _read_from_shm(
+                self.shm_name, self.shm_shape, self.shm_dtype, partner
+            )
+            e_cross = self.compute_energy_for_positions(pos_partner)
+        else:
+            e_cross = 0.0
+
+        # Write cross-energy to SHM slot n + i
+        shm = shared_memory.SharedMemory(name=self.energy_shm_name)
+        arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
+        arr[n + i] = e_cross
+        shm.close()
+
+        # All replicas must finish computing cross-energies
+        self.exchange_barrier.wait()
+
+        # ----- Phase 3: proposer decides accept/reject -----
+        # The lower-indexed replica in each pair is the proposer.
+        if phase == 0:
             if i % 2 == 0 and i + 1 < n:
                 j = i + 1
-                e_j = _read_energy_from_shm(self.energy_shm_name, n, j)
+                e_ii = e_self  # H_i(X_i)
+                e_jj = _read_energy_from_shm(self.energy_shm_name, n, j)  # H_j(X_j)
+                # Cross-energies from SHM
+                e_ij = e_cross  # H_i(X_j) — already computed above
+                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
+                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
+                e_ji = arr[n + j]  # H_j(X_i) — computed by replica j
+                shm.close()
+
                 accept = attempt_replica_exchange(
-                    e_i, e_j, self.temperatures[i], self.temperatures[j], rng
+                    e_ii, e_jj, e_ij, e_ji, T_ref, rng
                 )
                 if accept:
-                    pos_j = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, j)
-                    # Write own positions into j's slot so j can read them
-                    _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, j, pos)
-                    # Set own positions to j's old positions
+                    pos_j = _read_from_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, j
+                    )
+                    _write_to_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, j, pos
+                    )
                     self._set_positions_nm(pos_j)
                     swapped = True
-                # Signal j: accepted(1) or rejected(0) via energy shm temporarily unused slot;
-                # use a dedicated flag in energy shm second half if available.
-                # Simpler: write a sentinel into the energy array at slot j's "flag position".
-                # We use a separate 1-byte convention via the barrier + a flag shm.
-                # --- Actually write accept flag into energy array at index n+j ---
-                # (We allocate energy shm as 2*n doubles: first n = energies, next n = flags)
+
+                # Write accept/reject flag for partner: reuse energy SHM slot n+j
                 shm = shared_memory.SharedMemory(name=self.energy_shm_name)
                 arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
                 arr[n + j] = 1.0 if accept else 0.0
                 shm.close()
         else:
-            # odd phase: lower replica in pair has odd index
             if i % 2 == 1 and i + 1 < n:
                 j = i + 1
-                e_j = _read_energy_from_shm(self.energy_shm_name, n, j)
+                e_ii = e_self
+                e_jj = _read_energy_from_shm(self.energy_shm_name, n, j)
+                e_ij = e_cross
+                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
+                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
+                e_ji = arr[n + j]
+                shm.close()
+
                 accept = attempt_replica_exchange(
-                    e_i, e_j, self.temperatures[i], self.temperatures[j], rng
+                    e_ii, e_jj, e_ij, e_ji, T_ref, rng
                 )
                 if accept:
-                    pos_j = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, j)
-                    _write_to_shm(self.shm_name, self.shm_shape, self.shm_dtype, j, pos)
+                    pos_j = _read_from_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, j
+                    )
+                    _write_to_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, j, pos
+                    )
                     self._set_positions_nm(pos_j)
                     swapped = True
+
                 shm = shared_memory.SharedMemory(name=self.energy_shm_name)
                 arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
                 arr[n + j] = 1.0 if accept else 0.0
                 shm.close()
 
-        # All proposers must finish writing before acceptors read the flag
+        # All proposers must finish before acceptors read the flag
         self.exchange_barrier.wait()
 
-        # Higher-indexed replica in each pair reads the flag and applies swap
+        # Higher-indexed replica in each pair reads flag and applies swap
         if phase == 0:
-            if i % 2 == 1 and i - 1 >= 0:  # i is the upper partner
-                lower = i - 1
+            if i % 2 == 1 and i - 1 >= 0:
                 shm = shared_memory.SharedMemory(name=self.energy_shm_name)
                 arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
                 accept = arr[n + i] > 0.5
                 shm.close()
                 if accept:
-                    pos_lower = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, i)
-                    # slot i now contains the old pos of lower (written by lower)
-                    # our old pos was written into slot i by lower already; read it:
-                    # Actually lower wrote *our* old pos into slot j=i, so read it:
+                    pos_lower = _read_from_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, i
+                    )
                     self._set_positions_nm(pos_lower)
                     swapped = True
         else:
             if i % 2 == 0 and i - 1 >= 0 and i > 0:
-                lower = i - 1
                 shm = shared_memory.SharedMemory(name=self.energy_shm_name)
                 arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
                 accept = arr[n + i] > 0.5
                 shm.close()
                 if accept:
-                    pos_lower = _read_from_shm(self.shm_name, self.shm_shape, self.shm_dtype, i)
+                    pos_lower = _read_from_shm(
+                        self.shm_name, self.shm_shape, self.shm_dtype, i
+                    )
                     self._set_positions_nm(pos_lower)
                     swapped = True
 
@@ -441,7 +506,7 @@ def replica_main(
                 worker.simulation,
                 worker.topology,
                 worker.conformation_positions,
-                worker.temperature,
+                worker.reference_temperature,
                 rng,
             )
             if accepted:

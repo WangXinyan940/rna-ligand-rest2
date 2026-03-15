@@ -86,20 +86,33 @@ def attempt_conformation_swap(
 
 
 def attempt_replica_exchange(
-    e_i: float,
-    e_j: float,
-    T_i: float,
-    T_j: float,
+    e_ii: float,
+    e_jj: float,
+    e_ij: float,
+    e_ji: float,
+    T_ref: float,
     rng: np.random.Generator,
 ) -> bool:
     """
-    Attempt temperature-based replica exchange between replica i (T_i) and j (T_j).
-    Uses the standard REMD Metropolis criterion:
-      delta = (1/kT_i - 1/kT_j) * (E_j - E_i)
+    REST2 Hamiltonian replica exchange (HREX) Metropolis criterion.
+
+    All replicas run at the same integrator temperature T_ref (= T_low).
+    Effective temperatures are achieved via Hamiltonian scaling only.
+
+    Parameters
+    ----------
+    e_ii : energy of replica i's coords under replica i's Hamiltonian, H_i(X_i)
+    e_jj : energy of replica j's coords under replica j's Hamiltonian, H_j(X_j)
+    e_ij : energy of replica j's coords under replica i's Hamiltonian, H_i(X_j)
+    e_ji : energy of replica i's coords under replica j's Hamiltonian, H_j(X_i)
+    T_ref : reference temperature T_low (K), same for all replicas
+
+    Acceptance criterion:
+      Δ = β_0 * [H_i(X_j) + H_j(X_i) - H_i(X_i) - H_j(X_j)]
+      accept with min(1, exp(-Δ))
     """
-    beta_i = 1.0 / (KB * T_i)
-    beta_j = 1.0 / (KB * T_j)
-    delta = (beta_i - beta_j) * (e_j - e_i)
+    beta_0 = 1.0 / (KB * T_ref)
+    delta = beta_0 * (e_ij + e_ji - e_ii - e_jj)
     if delta <= 0.0:
         return True
     return rng.random() < math.exp(-delta)

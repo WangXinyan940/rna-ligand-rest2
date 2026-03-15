@@ -16,10 +16,11 @@ Simulation design
 Note on velocities
 ------------------
 equilibrate_all_conformations now returns velocities from the final NPT
-phase, but each replica runs at a temperature different from T_low, so
+phase.  In REST2, all replicas run at the same integrator temperature T_low;
+effective temperatures are achieved solely through Hamiltonian scaling.
 ReplicaWorker re-samples velocities from the Maxwell-Boltzmann distribution
-at its own temperature on startup (setVelocitiesToTemperature).  The
-equilibrated velocities are therefore not forwarded to replica subprocesses.
+at T_low on startup (setVelocitiesToTemperature).  The equilibrated
+velocities are therefore not forwarded to replica subprocesses.
 """
 from __future__ import annotations
 
@@ -270,8 +271,10 @@ def main():
     #
     # Each replica starts from the equilibrated positions of one
     # conformation (round-robin) and re-samples velocities from the
-    # Maxwell-Boltzmann distribution at its own temperature inside
+    # Maxwell-Boltzmann distribution at T_low inside
     # ReplicaWorker.__init__ via setVelocitiesToTemperature.
+    # The per-replica effective temperature T is only used to compute
+    # REST2 scaling factors (lambda = T_low / T).
     # ----------------------------------------------------------------
     print(f"\n[RUN] Launching {args.n_replicas} REST2/HREX replica workers...")
     result_queue = mp.Queue()
