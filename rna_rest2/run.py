@@ -151,18 +151,18 @@ def parse_args():
     # Temperature
     parser.add_argument("--T_low", type=float, default=300.0,
                         help="Lowest replica temperature (K).")
-    parser.add_argument("--T_high", type=float, default=400.0,
+    parser.add_argument("--T_high", type=float, default=600.0,
                         help="Highest replica temperature (K).")
     parser.add_argument("--n_replicas", type=int, default=4,
                         help="Number of REST2 replicas.")
     # Production
     parser.add_argument("--n_steps", type=int, default=5_000_000,
                         help="Total production MD steps per replica.")
-    parser.add_argument("--steps_per_block", type=int, default=500,
+    parser.add_argument("--steps_per_block", type=int, default=5000,
                         help="Steps per block between exchange checks.")
-    parser.add_argument("--hrex_interval", type=int, default=500,
+    parser.add_argument("--hrex_interval", type=int, default=5000,
                         help="Steps between HREX neighbor exchange rounds.")
-    parser.add_argument("--conf_interval", type=int, default=1000,
+    parser.add_argument("--conf_interval", type=int, default=5000,
                         help="Steps between conformation library MC (hottest replica only).")
     # Equilibration
     parser.add_argument("--em_max_iter", type=int, default=2000)

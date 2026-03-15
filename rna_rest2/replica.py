@@ -51,6 +51,7 @@ from openmm import (
     XmlSerializer,
     app,
     unit,
+    MonteCarloBarostat,
 )
 from openmm.app import DCDReporter, StateDataReporter, Simulation
 
@@ -82,7 +83,6 @@ def _read_from_shm(
     replica_j: int,
 ) -> np.ndarray:
     shm = shared_memory.SharedMemory(name=shm_name)
-    arr = np.ndarray(shm_shape, dtype=shm.buf)
     arr = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     flat = arr[replica_j, :].copy()
     shm.close()
@@ -172,6 +172,9 @@ class ReplicaWorker:
         self.is_hottest = (replica_id == n_replicas - 1)
 
         system = XmlSerializer.deserialize(system_xml)
+        system.addForce(
+            MonteCarloBarostat(1.0 * unit.bar, self.temperature)
+        )
         self.system = system
         self.original_params = store_original_parameters(system, topology)
 
@@ -221,6 +224,7 @@ class ReplicaWorker:
                 temperature=True,
                 density=True,
                 volume=True,
+                speed=True,
             )
         )
 
@@ -323,94 +327,45 @@ class ReplicaWorker:
         self.exchange_barrier.wait()
 
         # ----- Phase 3: proposer decides accept/reject -----
-        # The lower-indexed replica in each pair is the proposer.
-        if phase == 0:
-            if i % 2 == 0 and i + 1 < n:
-                j = i + 1
-                e_ii = e_self  # H_i(X_i)
-                e_jj = _read_energy_from_shm(self.energy_shm_name, n, j)  # H_j(X_j)
-                # Cross-energies from SHM
-                e_ij = e_cross  # H_i(X_j) — already computed above
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                e_ji = arr[n + j]  # H_j(X_i) — computed by replica j
-                shm.close()
+        # The even-indexed replica in each pair proposes the exchange.
+        if i % 2 == 0 and partner >= 0 and partner < n:
+            j = partner
+            e_ii = e_self  # H_i(X_i)
+            e_jj = _read_energy_from_shm(self.energy_shm_name, n, j)  # H_j(X_j)
+            # Cross-energies from SHM
+            e_ij = e_cross  # H_i(X_j) — already computed above
+            shm = shared_memory.SharedMemory(name=self.energy_shm_name)
+            arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
+            e_ji = arr[n + j]  # H_j(X_i) — computed by replica j
+            shm.close()
 
-                accept = attempt_replica_exchange(
-                    e_ii, e_jj, e_ij, e_ji, T_ref, rng
+            accept = attempt_replica_exchange(
+                e_ii, e_jj, e_ij, e_ji, T_ref, rng
+            )
+            print(f"Replica {i}-{j} exchange (dE={e_ij+e_ji-e_ii-e_jj:.2f} kJ/mol): {'ACCEPT' if accept else 'REJECT'}")
+            if accept:
+                # rewrite positions in shared memory
+                pos_i = _read_from_shm(
+                    self.shm_name, self.shm_shape, self.shm_dtype, i
                 )
-                if accept:
-                    pos_j = _read_from_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, j
-                    )
-                    _write_to_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, j, pos
-                    )
-                    self._set_positions_nm(pos_j)
-                    swapped = True
-
-                # Write accept/reject flag for partner: reuse energy SHM slot n+j
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                arr[n + j] = 1.0 if accept else 0.0
-                shm.close()
-        else:
-            if i % 2 == 1 and i + 1 < n:
-                j = i + 1
-                e_ii = e_self
-                e_jj = _read_energy_from_shm(self.energy_shm_name, n, j)
-                e_ij = e_cross
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                e_ji = arr[n + j]
-                shm.close()
-
-                accept = attempt_replica_exchange(
-                    e_ii, e_jj, e_ij, e_ji, T_ref, rng
+                pos_j = _read_from_shm(
+                    self.shm_name, self.shm_shape, self.shm_dtype, j
                 )
-                if accept:
-                    pos_j = _read_from_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, j
-                    )
-                    _write_to_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, j, pos
-                    )
-                    self._set_positions_nm(pos_j)
-                    swapped = True
-
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                arr[n + j] = 1.0 if accept else 0.0
-                shm.close()
+                _write_to_shm(
+                    self.shm_name, self.shm_shape, self.shm_dtype, i, pos_j
+                )
+                _write_to_shm(
+                    self.shm_name, self.shm_shape, self.shm_dtype, j, pos_i
+                )
 
         # All proposers must finish before acceptors read the flag
         self.exchange_barrier.wait()
 
-        # Higher-indexed replica in each pair reads flag and applies swap
-        if phase == 0:
-            if i % 2 == 1 and i - 1 >= 0:
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                accept = arr[n + i] > 0.5
-                shm.close()
-                if accept:
-                    pos_lower = _read_from_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, i
-                    )
-                    self._set_positions_nm(pos_lower)
-                    swapped = True
-        else:
-            if i % 2 == 0 and i - 1 >= 0 and i > 0:
-                shm = shared_memory.SharedMemory(name=self.energy_shm_name)
-                arr = np.ndarray((2 * n,), dtype=np.float64, buffer=shm.buf)
-                accept = arr[n + i] > 0.5
-                shm.close()
-                if accept:
-                    pos_lower = _read_from_shm(
-                        self.shm_name, self.shm_shape, self.shm_dtype, i
-                    )
-                    self._set_positions_nm(pos_lower)
-                    swapped = True
+        # Load new positions
+        new_pos = _read_from_shm(
+            self.shm_name, self.shm_shape, self.shm_dtype, i
+        )
+        self._set_positions_nm(new_pos)
 
         # Final barrier: all replicas have applied swaps
         self.exchange_barrier.wait()
@@ -509,6 +464,7 @@ def replica_main(
                 worker.reference_temperature,
                 rng,
             )
+            print(f"Replica {replica_id}: Conformation swap {'accepted' if accepted else 'rejected'}")
             if accepted:
                 conf_swap_accepted += 1
 

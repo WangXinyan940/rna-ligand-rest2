@@ -158,7 +158,7 @@ def _add_reporters(
     dcd: bool = False,
     extra_props: dict | None = None,
 ) -> None:
-    props = dict(step=True, potentialEnergy=True, temperature=True)
+    props = dict(step=True, potentialEnergy=True, temperature=True, speed=True)
     if extra_props:
         props.update(extra_props)
     sim.reporters.append(
