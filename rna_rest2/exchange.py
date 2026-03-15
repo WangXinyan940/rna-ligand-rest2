@@ -32,7 +32,7 @@ def compute_potential_energy(simulation: Simulation) -> float:
 def attempt_conformation_swap(
     simulation: Simulation,
     topology: app.Topology,
-    conformation_pool: list,  # list of (pos_nm, box_nm) tuples
+    conformation_pool: list,  # list of (pos_nm, vel_nm_ps, box_nm) tuples
     temperature: unit.Quantity,
     rng: np.random.Generator,
 ) -> bool:
@@ -40,8 +40,8 @@ def attempt_conformation_swap(
     Attempt a Metropolis MC swap of the current coordinates with a randomly
     chosen conformation from `conformation_pool`.
 
-    Each pool entry is a tuple (positions_nm, box_vectors_nm) so that
-    box vectors are swapped along with positions.
+    Each pool entry is a tuple (positions_nm, velocities_nm_ps, box_vectors_nm)
+    so that positions, velocities, and box vectors are swapped together.
 
     Steps:
     1. Compute E_current
@@ -63,7 +63,7 @@ def attempt_conformation_swap(
 
     # Pick a random conformation
     j = rng.integers(0, len(conformation_pool))
-    proposed_pos, proposed_box = conformation_pool[j]
+    proposed_pos, proposed_vel, proposed_box = conformation_pool[j]
 
     # Set proposed box vectors first, then positions
     simulation.context.setPeriodicBoxVectors(
@@ -72,7 +72,7 @@ def attempt_conformation_swap(
     simulation.context.setPositions(
         unit.Quantity(proposed_pos, unit.nanometer)
     )
-    # Randomize velocities for fair comparison
+    # Randomize velocities for fair energy comparison (potential energy only)
     simulation.context.setVelocitiesToTemperature(temperature)
 
     e_proposed = compute_potential_energy(simulation)
@@ -86,8 +86,16 @@ def attempt_conformation_swap(
     else:
         # Update the pool entry with the previous current conformation
         old_pos = state_current.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        old_vel = state_current.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        )
         old_box = state_current.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
-        conformation_pool[j] = (old_pos, old_box)
+        conformation_pool[j] = (old_pos, old_vel, old_box)
+
+        # Apply the pool conformer's velocities to the simulation
+        simulation.context.setVelocities(
+            unit.Quantity(proposed_vel, unit.nanometer / unit.picosecond)
+        )
 
     return accepted
 

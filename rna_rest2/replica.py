@@ -162,7 +162,7 @@ class ReplicaWorker:
         n_replicas: int,
         topology: app.Topology,
         system_xml: str,
-        conformation_positions: list,               # [(pos_nm, box_nm), ...] tuples
+        conformation_positions: list,               # [(pos_nm, vel_nm_ps, box_nm), ...] tuples
         initial_positions: np.ndarray,             # [n_atoms, 3] nm
         box_vectors: np.ndarray,                   # [3, 3] nm
         temperature: float,                        # Kelvin
@@ -459,7 +459,7 @@ def replica_main(
     n_replicas: int,
     topology,
     system_xml: str,
-    conformation_positions: list,             # [(pos_nm, box_nm), ...]
+    conformation_positions: list,             # [(pos_nm, vel_nm_ps, box_nm), ...]
     initial_positions: np.ndarray,
     box_vectors: np.ndarray,
     temperature: float,

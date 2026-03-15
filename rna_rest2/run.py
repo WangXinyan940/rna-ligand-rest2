@@ -269,9 +269,9 @@ def main():
     print(f"[RUN] Box      SHM: {box_shm.name}, shape={box_shm_shape}")
     print(f"[RUN] Energy   SHM: {energy_shm.name}, size={2 * args.n_replicas} x float64")
 
-    # Conformation pool: equilibrated (positions, box_vectors) for all conformers
+    # Conformation pool: equilibrated (positions, velocities, box_vectors) for all conformers
     conformation_pool = [
-        (equil_results[i][1], equil_results[i][3])  # (pos_nm, box_nm)
+        (equil_results[i][1], equil_results[i][2], equil_results[i][3])  # (pos_nm, vel_nm_ps, box_nm)
         for i in range(n_conformations)
     ]
 
@@ -313,7 +313,7 @@ def main():
                 args.n_replicas,
                 solv_top,
                 ref_system_xml,
-                [(pos.copy(), bx.copy()) for pos, bx in conformation_pool],
+                [(pos.copy(), vel.copy(), bx.copy()) for pos, vel, bx in conformation_pool],
                 init_pos_nm.copy(),
                 init_box_nm,
                 T,
